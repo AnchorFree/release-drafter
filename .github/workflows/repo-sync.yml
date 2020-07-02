@@ -1,6 +1,6 @@
 on:
   schedule:
-  - cron:  "*/15 * * * *"
+  - cron:  "0 0 * * 1"
 jobs:
   repo-sync:
     runs-on: ubuntu-latest
@@ -11,5 +11,5 @@ jobs:
       with:
         source_repo: "release-drafter/release-drafter"
         source_branch: "master"
-        destination_branch: "DEVOPS-4646-cicd-test"
+        destination_branch: "master"
         github_token: ${{ secrets.GITHUB_TOKEN }}
