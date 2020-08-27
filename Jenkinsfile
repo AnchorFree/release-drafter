@@ -18,10 +18,9 @@ pipeline {
             }
             steps {
                 script {
-                        println(
-                            gitSyncFork(BRANCH, REPO, UPSTREAM_REPO)
-                        )
-                    }
+                    println(
+                        gitSyncFork(BRANCH, REPO, UPSTREAM_REPO)
+                    )
                 }
             }
         }
