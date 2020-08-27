@@ -36,7 +36,7 @@ pipeline {
 */
 def gitSyncFork(
                 String branch,
-                String repo
+                String repo,
                 String upstreamRepo
 ) {
     cmd = null
