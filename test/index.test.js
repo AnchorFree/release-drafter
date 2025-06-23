@@ -1,13 +1,34 @@
 const nock = require('nock')
-const route = require('nock-knock/lib').default
-const { Probot, Octokit } = require('probot')
-const getConfigMock = require('./helpers/config-mock')
+const { Probot, ProbotOctokit } = require('probot')
+const { getConfigMock } = require('./helpers/config-mock')
 const releaseDrafter = require('../index')
 const mockedEnv = require('mocked-env')
+const pino = require('pino')
+const Stream = require('node:stream')
+const pushPayload = require('./fixtures/push.json')
+const pushTagPayload = require('./fixtures/push-tag.json')
+const releasePayload = require('./fixtures/release.json')
+const release2Payload = require('./fixtures/release-2.json')
+const release3Payload = require('./fixtures/release-3.json')
+const preReleasePayload = require('./fixtures/pre-release.json')
+const pushNonMasterPayload = require('./fixtures/push-non-master-branch.json')
+const graphqlCommitsNoPRsPayload = require('./fixtures/graphql-commits-no-prs.json')
+const graphqlCommitsMergeCommit = require('./fixtures/__generated__/graphql-commits-merge-commit.json')
+const graphqlNullIncludePathMergeCommit = require('./fixtures/__generated__/graphql-include-null-path-merge-commit.json')
+const graphqlIncludePathMergeCommit = require('./fixtures/__generated__/graphql-include-path-src-5.md-merge-commit.json')
+const graphqlCommitsEmpty = require('./fixtures/graphql-commits-empty.json')
+const releaseDrafterFixture = require('./fixtures/release-draft.json')
+const graphqlCommitsOverlappingLabel = require('./fixtures/__generated__/graphql-commits-overlapping-label.json')
+const graphqlCommitsRebaseMerging = require('./fixtures/__generated__/graphql-commits-rebase-merging.json')
+const graphqlCommitsSquashMerging = require('./fixtures/__generated__/graphql-commits-squash-merging.json')
+const releaseSharedCommitDate = require('./fixtures/release-shared-commit-date.json')
+const graphqlCommitsForking = require('./fixtures/__generated__/graphql-commits-forking.json')
+const graphqlCommitsPaginated1 = require('./fixtures/graphql-commits-paginated-1.json')
+const graphqlCommitsPaginated2 = require('./fixtures/graphql-commits-paginated-2.json')
 
 nock.disableNetConnect()
 
-const cert = `-----BEGIN RSA PRIVATE KEY-----
+const privateKey = `-----BEGIN RSA PRIVATE KEY-----
 MIICXQIBAAKBgQC2RTg7dNjQMwPzFwF0gXFRCcRHha4H24PeK7ey6Ij39ay1hy2o
 H9NEZOxrmAb0bEBDuECImTsJdpgI6F3OwkJGsOkIH09xTk5tC4fkfY8N7LklK+uM
 ndN4+VUXTPSj/U8lQtCd9JnnUL/wXDc46wRJ0AAKsQtUw5n4e44f+aYggwIDAQAB
@@ -26,42 +47,53 @@ Pc6zWtW2XuNIGHw9pDj7v1yDolm7feBXLg8/u9APwHDy
 describe('release-drafter', () => {
   let probot
   let logger
-  let restoreEnv
+  let restoreEnvironment
+
+  const streamLogsToOutput = new Stream.Writable({ objectMode: true })
+  streamLogsToOutput._write = (object, encoding, done) => {
+    logger.push(JSON.parse(object))
+    done()
+  }
+
+  probot = new Probot({
+    appId: 179_208,
+    privateKey,
+    githubToken: 'test',
+    Octokit: ProbotOctokit.defaults({
+      retry: { enabled: false },
+      throttle: { enabled: false },
+    }),
+    log: pino(streamLogsToOutput),
+  })
+  probot.load(releaseDrafter)
 
   beforeEach(() => {
-    logger = jest.fn()
-    probot = new Probot({ id: 179208, cert, Octokit })
-    probot.load(releaseDrafter)
-    probot.logger.addStream({
-      level: 'trace',
-      stream: { write: logger },
-      type: 'raw',
-    })
+    logger = []
 
     nock('https://api.github.com')
       .post('/app/installations/179208/access_tokens')
       .reply(200, { token: 'test' })
 
-    let mockEnv = {}
+    let mockEnvironment = {}
 
     // We have to delete all the GITHUB_* envs before every test, because if
     // we're running the tests themselves inside a GitHub Actions container
     // they'll mess with the tests, and also because we set some of them in
     // tests and we don't want them to leak into other tests.
-    Object.keys(process.env)
-      .filter((key) => key.match(/^GITHUB_/))
-      .forEach((key) => {
-        mockEnv[key] = undefined
-      })
+    for (const key of Object.keys(process.env).filter((key) =>
+      key.match(/^GITHUB_/)
+    )) {
+      mockEnvironment[key] = undefined
+    }
 
-    restoreEnv = mockedEnv(mockEnv)
+    restoreEnvironment = mockedEnv(mockEnvironment)
   })
 
   afterAll(nock.restore)
 
   afterEach(() => {
     nock.cleanAll()
-    restoreEnv()
+    restoreEnvironment()
   })
 
   describe('push', () => {
@@ -69,15 +101,17 @@ describe('release-drafter', () => {
       it('does nothing', async () => {
         nock('https://api.github.com')
           .get(
-            '/repos/toolmantim/release-drafter-test-project/contents/.github/release-drafter.yml'
+            '/repos/toolmantim/release-drafter-test-project/contents/.github%2Frelease-drafter.yml'
           )
           .reply(404)
-          .get('/repos/toolmantim/.github/contents/.github/release-drafter.yml')
+          .get(
+            '/repos/toolmantim/.github/contents/.github%2Frelease-drafter.yml'
+          )
           .reply(404)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
       })
     })
@@ -87,35 +121,35 @@ describe('release-drafter', () => {
         getConfigMock()
 
         nock('https://api.github.com')
-          .post(route('/repos/:owner/:repo/releases'))
+          .post('/repos/:owner/:repo/releases')
           .reply(200, () => {
             throw new Error("Shouldn't create a new release")
           })
-          .patch(route('/repos/:owner/:repo/releases/:release_id'))
+          .patch('/repos/:owner/:repo/releases/:release_id')
           .reply(200, () => {
             throw new Error("Shouldn't update an existing release")
           })
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push-non-master-branch'),
+          payload: pushNonMasterPayload,
         })
       })
 
       describe('when configured for that branch', () => {
-        it('creates a release draft', async () => {
+        it('creates a release draft targeting that branch', async () => {
           getConfigMock('config-non-master-branch.yml')
 
           nock('https://api.github.com')
             .post('/graphql', (body) =>
               body.query.includes('query findCommitsWithAssociatedPullRequests')
             )
-            .reply(200, require('./fixtures/graphql-commits-no-prs.json'))
+            .reply(200, graphqlCommitsNoPRsPayload)
 
           nock('https://api.github.com')
             .get('/repos/toolmantim/release-drafter-test-project/releases')
             .query(true)
-            .reply(200, [require('./fixtures/release')])
+            .reply(200, [releasePayload])
             .post(
               '/repos/toolmantim/release-drafter-test-project/releases',
               (body) => {
@@ -126,19 +160,21 @@ describe('release-drafter', () => {
                   * No changes
                   ",
                     "draft": true,
+                    "make_latest": "true",
                     "name": "",
                     "prerelease": false,
                     "tag_name": "",
+                    "target_commitish": "refs/heads/some-branch",
                   }
                 `)
                 return true
               }
             )
-            .reply(200, require('./fixtures/release'))
+            .reply(200, releasePayload)
 
           await probot.receive({
             name: 'push',
-            payload: require('./fixtures/push-non-master-branch'),
+            payload: pushNonMasterPayload,
           })
         })
       })
@@ -149,18 +185,18 @@ describe('release-drafter', () => {
         getConfigMock('config-tag-reference.yml')
 
         nock('https://api.github.com')
-          .post(route('/repos/:owner/:repo/releases'))
+          .post('/repos/:owner/:repo/releases')
           .reply(200, () => {
             throw new Error("Shouldn't create a new release")
           })
-          .patch(route('/repos/:owner/:repo/releases/:release_id'))
+          .patch('/repos/:owner/:repo/releases/:release_id')
           .reply(200, () => {
             throw new Error("Shouldn't update an existing release")
           })
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
       })
 
@@ -172,15 +208,12 @@ describe('release-drafter', () => {
             .post('/graphql', (body) =>
               body.query.includes('query findCommitsWithAssociatedPullRequests')
             )
-            .reply(
-              200,
-              require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-            )
+            .reply(200, graphqlCommitsMergeCommit)
 
           nock('https://api.github.com')
             .get('/repos/toolmantim/release-drafter-test-project/releases')
             .query(true)
-            .reply(200, [require('./fixtures/release')])
+            .reply(200, [releasePayload])
             .post(
               '/repos/toolmantim/release-drafter-test-project/releases',
               (body) => {
@@ -195,19 +228,21 @@ describe('release-drafter', () => {
                   * 👽 Add alien technology (#1) @TimonVS
                   ",
                     "draft": true,
+                    "make_latest": "true",
                     "name": "",
                     "prerelease": false,
                     "tag_name": "",
+                    "target_commitish": "",
                   }
                 `)
                 return true
               }
             )
-            .reply(200, require('./fixtures/release'))
+            .reply(200, releasePayload)
 
           await probot.receive({
             name: 'push',
-            payload: require('./fixtures/push-tag'),
+            payload: pushTagPayload,
           })
         })
       })
@@ -221,10 +256,7 @@ describe('release-drafter', () => {
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-          )
+          .reply(200, graphqlCommitsMergeCommit)
 
         nock('https://api.github.com')
           .get(
@@ -248,17 +280,19 @@ describe('release-drafter', () => {
                 Previous tag: ''
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "",
                   "prerelease": false,
                   "tag_name": "",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
-        const payload = require('./fixtures/push')
+        const payload = pushPayload
 
         await probot.receive({
           name: 'push',
@@ -277,20 +311,13 @@ describe('release-drafter', () => {
           .get(
             '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
           )
-          .reply(200, [
-            require('./fixtures/release-2'),
-            require('./fixtures/release'),
-            require('./fixtures/release-3'),
-          ])
+          .reply(200, [release2Payload, releasePayload, release3Payload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-          )
+          .reply(200, graphqlCommitsMergeCommit)
 
         nock('https://api.github.com')
           .post(
@@ -307,19 +334,21 @@ describe('release-drafter', () => {
                 * 👽 Add alien technology (#1) @TimonVS
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "",
                   "prerelease": false,
                   "tag_name": "",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -330,25 +359,19 @@ describe('release-drafter', () => {
 
         // GitHub actions should use the GITHUB_REF and not the payload ref
         process.env['GITHUB_REF'] = 'refs/heads/master'
+        process.env['GITHUB_ACTIONS'] = 'true'
 
         nock('https://api.github.com')
           .get(
             '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
           )
-          .reply(200, [
-            require('./fixtures/release-2'),
-            require('./fixtures/release'),
-            require('./fixtures/release-3'),
-          ])
+          .reply(200, [release2Payload, releasePayload, release3Payload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-          )
+          .reply(200, graphqlCommitsMergeCommit)
 
         nock('https://api.github.com')
           .post(
@@ -365,21 +388,23 @@ describe('release-drafter', () => {
                 * 👽 Add alien technology (#1) @TimonVS
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "",
                   "prerelease": false,
                   "tag_name": "",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
           // This payload has a different ref to GITHUB_REF, which is how GitHub
           // Action merge push payloads behave
-          payload: require('./fixtures/push-non-master-branch'),
+          payload: pushNonMasterPayload,
         })
 
         expect.assertions(1)
@@ -392,16 +417,13 @@ describe('release-drafter', () => {
           .get(
             '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
           )
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-          )
+          .reply(200, graphqlCommitsMergeCommit)
 
         nock('https://api.github.com')
           .post(
@@ -409,21 +431,23 @@ describe('release-drafter', () => {
             (body) => {
               expect(body).toMatchInlineSnapshot(`
                 Object {
-                  "body": "Placeholder with example. Automatically calculated values are next major=3.0.0, minor=2.1.0, patch=2.0.1",
+                  "body": "Placeholder with example. Automatically calculated values are next major=3.0.0 (major=3, minor=0, patch=0), minor=2.1.0 (major=2, minor=1, patch=0), patch=2.0.1 (major=2, minor=0, patch=1)",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "v2.0.1 (Code name: Placeholder)",
                   "prerelease": false,
                   "tag_name": "v2.0.1",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -437,16 +461,13 @@ describe('release-drafter', () => {
             .get(
               '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
             )
-            .reply(200, [require('./fixtures/release')])
+            .reply(200, [releasePayload])
 
           nock('https://api.github.com')
             .post('/graphql', (body) =>
               body.query.includes('query findCommitsWithAssociatedPullRequests')
             )
-            .reply(
-              200,
-              require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-            )
+            .reply(200, graphqlCommitsMergeCommit)
 
           nock('https://api.github.com')
             .post(
@@ -460,19 +481,21 @@ describe('release-drafter', () => {
                   * Change: #2 'Add big feature' @TimonVS
                   * Change: #1 '👽 Add alien technology' @TimonVS",
                     "draft": true,
+                    "make_latest": "true",
                     "name": "",
                     "prerelease": false,
                     "tag_name": "",
+                    "target_commitish": "refs/heads/master",
                   }
                 `)
                 return true
               }
             )
-            .reply(200, require('./fixtures/release'))
+            .reply(200, releasePayload)
 
           await probot.receive({
             name: 'push',
-            payload: require('./fixtures/push'),
+            payload: pushPayload,
           })
 
           expect.assertions(1)
@@ -487,16 +510,13 @@ describe('release-drafter', () => {
             .get(
               '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
             )
-            .reply(200, [require('./fixtures/release')])
+            .reply(200, [releasePayload])
 
           nock('https://api.github.com')
             .post('/graphql', (body) =>
               body.query.includes('query findCommitsWithAssociatedPullRequests')
             )
-            .reply(
-              200,
-              require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-            )
+            .reply(200, graphqlCommitsMergeCommit)
 
           nock('https://api.github.com')
             .post(
@@ -510,19 +530,21 @@ describe('release-drafter', () => {
                   * Change: #2 'Add big feature' ![I'm kind of a big deal](https://media.giphy.com/media/9LFBOD8a1Ip2M/giphy.gif)
                   * Change: #1 '👽 Add alien technology' Space invasion 👾",
                     "draft": true,
+                    "make_latest": "true",
                     "name": "",
                     "prerelease": false,
                     "tag_name": "",
+                    "target_commitish": "refs/heads/master",
                   }
                 `)
                 return true
               }
             )
-            .reply(200, require('./fixtures/release'))
+            .reply(200, releasePayload)
 
           await probot.receive({
             name: 'push',
-            payload: require('./fixtures/push'),
+            payload: pushPayload,
           })
 
           expect.assertions(1)
@@ -537,16 +559,13 @@ describe('release-drafter', () => {
             .get(
               '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
             )
-            .reply(200, [require('./fixtures/release')])
+            .reply(200, [releasePayload])
 
           nock('https://api.github.com')
             .post('/graphql', (body) =>
               body.query.includes('query findCommitsWithAssociatedPullRequests')
             )
-            .reply(
-              200,
-              require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-            )
+            .reply(200, graphqlCommitsMergeCommit)
 
           nock('https://api.github.com')
             .post(
@@ -560,19 +579,21 @@ describe('release-drafter', () => {
                   * Change: https://github.com/toolmantim/release-drafter-test-project/pull/2 'Add big feature' @TimonVS
                   * Change: https://github.com/toolmantim/release-drafter-test-project/pull/1 '👽 Add alien technology' @TimonVS",
                     "draft": true,
+                    "make_latest": "true",
                     "name": "",
                     "prerelease": false,
                     "tag_name": "",
+                    "target_commitish": "refs/heads/master",
                   }
                 `)
                 return true
               }
             )
-            .reply(200, require('./fixtures/release'))
+            .reply(200, releasePayload)
 
           await probot.receive({
             name: 'push',
-            payload: require('./fixtures/push'),
+            payload: pushPayload,
           })
 
           expect.assertions(1)
@@ -587,16 +608,13 @@ describe('release-drafter', () => {
             .get(
               '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
             )
-            .reply(200, [require('./fixtures/release')])
+            .reply(200, [releasePayload])
 
           nock('https://api.github.com')
             .post('/graphql', (body) =>
               body.query.includes('query findCommitsWithAssociatedPullRequests')
             )
-            .reply(
-              200,
-              require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-            )
+            .reply(200, graphqlCommitsMergeCommit)
 
           nock('https://api.github.com')
             .post(
@@ -606,19 +624,109 @@ describe('release-drafter', () => {
                   Object {
                     "body": "A big thanks to: @TimonVS and Ada Lovelace",
                     "draft": true,
+                    "make_latest": "true",
                     "name": "",
                     "prerelease": false,
                     "tag_name": "",
+                    "target_commitish": "refs/heads/master",
                   }
                 `)
                 return true
               }
             )
-            .reply(200, require('./fixtures/release'))
+            .reply(200, releasePayload)
 
           await probot.receive({
             name: 'push',
-            payload: require('./fixtures/push'),
+            payload: pushPayload,
+          })
+
+          expect.assertions(1)
+        })
+
+        it('uses no-contributors-template when there are no contributors', async () => {
+          getConfigMock('config-with-contributors.yml')
+
+          nock('https://api.github.com')
+            .get(
+              '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
+            )
+            .reply(200, [releasePayload])
+
+          nock('https://api.github.com')
+            .post('/graphql', (body) =>
+              body.query.includes('query findCommitsWithAssociatedPullRequests')
+            )
+            .reply(200, graphqlCommitsEmpty)
+
+          nock('https://api.github.com')
+            .post(
+              '/repos/toolmantim/release-drafter-test-project/releases',
+              (body) => {
+                expect(body).toMatchInlineSnapshot(`
+                  Object {
+                    "body": "A big thanks to: Nobody",
+                    "draft": true,
+                    "make_latest": "true",
+                    "name": "",
+                    "prerelease": false,
+                    "tag_name": "",
+                    "target_commitish": "refs/heads/master",
+                  }
+                `)
+                return true
+              }
+            )
+            .reply(200, releasePayload)
+
+          await probot.receive({
+            name: 'push',
+            payload: pushPayload,
+          })
+
+          expect.assertions(1)
+        })
+      })
+
+      describe('with exclude-contributors config', () => {
+        it('excludes matching contributors by username', async () => {
+          getConfigMock('config-with-exclude-contributors.yml')
+
+          nock('https://api.github.com')
+            .get(
+              '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
+            )
+            .reply(200, [releasePayload])
+
+          nock('https://api.github.com')
+            .post('/graphql', (body) =>
+              body.query.includes('query findCommitsWithAssociatedPullRequests')
+            )
+            .reply(200, graphqlCommitsMergeCommit)
+
+          nock('https://api.github.com')
+            .post(
+              '/repos/toolmantim/release-drafter-test-project/releases',
+              (body) => {
+                expect(body).toMatchInlineSnapshot(`
+                  Object {
+                    "body": "A big thanks to: Ada Lovelace",
+                    "draft": true,
+                    "make_latest": "true",
+                    "name": "",
+                    "prerelease": false,
+                    "tag_name": "",
+                    "target_commitish": "refs/heads/master",
+                  }
+                `)
+                return true
+              }
+            )
+            .reply(200, releasePayload)
+
+          await probot.receive({
+            name: 'push',
+            payload: pushPayload,
           })
 
           expect.assertions(1)
@@ -634,22 +742,16 @@ describe('release-drafter', () => {
           .get(
             '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
           )
-          .reply(200, [
-            require('./fixtures/release-2'),
-            require('./fixtures/release'),
-            require('./fixtures/release-3'),
-          ])
+          .reply(200, [release2Payload, releasePayload, release3Payload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) => {
-            expect(body.variables.since).toBe(
-              require('./fixtures/release-3').created_at
-            )
+            expect(body.variables.since).toBe(release3Payload.created_at)
             return body.query.includes(
               'query findCommitsWithAssociatedPullRequests'
             )
           })
-          .reply(200, require('./fixtures/graphql-commits-empty.json'))
+          .reply(200, graphqlCommitsEmpty)
 
         nock('https://api.github.com')
           .post(
@@ -662,19 +764,21 @@ describe('release-drafter', () => {
                 * No changes
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "",
                   "prerelease": false,
                   "tag_name": "",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(2)
@@ -693,7 +797,7 @@ describe('release-drafter', () => {
             .post('/graphql', (body) =>
               body.query.includes('query findCommitsWithAssociatedPullRequests')
             )
-            .reply(200, require('./fixtures/graphql-commits-empty.json'))
+            .reply(200, graphqlCommitsEmpty)
 
           nock('https://api.github.com')
             .post(
@@ -703,19 +807,21 @@ describe('release-drafter', () => {
                   Object {
                     "body": "* No changes mmkay",
                     "draft": true,
+                    "make_latest": "true",
                     "name": "",
                     "prerelease": false,
                     "tag_name": "",
+                    "target_commitish": "refs/heads/master",
                   }
                 `)
                 return true
               }
             )
-            .reply(200, require('./fixtures/release'))
+            .reply(200, releasePayload)
 
           await probot.receive({
             name: 'push',
-            payload: require('./fixtures/push'),
+            payload: pushPayload,
           })
 
           expect.assertions(1)
@@ -730,16 +836,13 @@ describe('release-drafter', () => {
         nock('https://api.github.com')
           .get('/repos/toolmantim/release-drafter-test-project/releases')
           .query(true)
-          .reply(200, [require('./fixtures/release-draft.json')])
+          .reply(200, [releaseDrafterFixture])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-          )
+          .reply(200, graphqlCommitsMergeCommit)
 
         nock('https://api.github.com')
           .patch(
@@ -756,19 +859,80 @@ describe('release-drafter', () => {
                 * 👽 Add alien technology (#1) @TimonVS
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "v3.0.0-beta",
                   "prerelease": false,
                   "tag_name": "v3.0.0-beta",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
+        })
+
+        expect.assertions(1)
+      })
+    })
+
+    describe('with owner and repository templating', () => {
+      it('include full-changelog link in output', async () => {
+        getConfigMock('config-with-compare-link.yml')
+
+        nock('https://api.github.com')
+          .get('/repos/toolmantim/release-drafter-test-project/releases')
+          .query(true)
+          .reply(200, [releasePayload])
+
+        nock('https://api.github.com')
+          .post('/graphql', (body) =>
+            body.query.includes('query findCommitsWithAssociatedPullRequests')
+          )
+          .reply(200, graphqlCommitsMergeCommit)
+
+        nock('https://api.github.com')
+          .post(
+            '/repos/toolmantim/release-drafter-test-project/releases',
+            (body) => {
+              expect(body).toMatchInlineSnapshot(`
+                Object {
+                  "body": "# What's Changed
+
+                * Add documentation (#5) @TimonVS
+                * Update dependencies (#4) @TimonVS
+
+                ## 🚀 Features
+
+                * Add big feature (#2) @TimonVS
+                * 👽 Add alien technology (#1) @TimonVS
+
+                ## 🐛 Bug Fixes
+
+                * Bug fixes (#3) @TimonVS
+
+                **Full Changelog**: https://github.com/toolmantim/release-drafter-test-project/compare/v2.0.0...v2.0.1
+                ",
+                  "draft": true,
+                  "make_latest": "true",
+                  "name": "",
+                  "prerelease": false,
+                  "tag_name": "",
+                  "target_commitish": "refs/heads/master",
+                }
+              `)
+              return true
+            }
+          )
+          .reply(200, releasePayload)
+
+        await probot.receive({
+          name: 'push',
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -782,16 +946,13 @@ describe('release-drafter', () => {
         nock('https://api.github.com')
           .get('/repos/toolmantim/release-drafter-test-project/releases')
           .query(true)
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-          )
+          .reply(200, graphqlCommitsMergeCommit)
 
         nock('https://api.github.com')
           .post(
@@ -814,19 +975,78 @@ describe('release-drafter', () => {
                 * Bug fixes (#3) @TimonVS
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "",
                   "prerelease": false,
                   "tag_name": "",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
+        })
+
+        expect.assertions(1)
+      })
+
+      it('categorizes pull requests with other category at the bottom', async () => {
+        getConfigMock('config-with-categories-with-other-category.yml')
+
+        nock('https://api.github.com')
+          .get('/repos/toolmantim/release-drafter-test-project/releases')
+          .query(true)
+          .reply(200, [releasePayload])
+
+        nock('https://api.github.com')
+          .post('/graphql', (body) =>
+            body.query.includes('query findCommitsWithAssociatedPullRequests')
+          )
+          .reply(200, graphqlCommitsMergeCommit)
+
+        nock('https://api.github.com')
+          .post(
+            '/repos/toolmantim/release-drafter-test-project/releases',
+            (body) => {
+              expect(body).toMatchInlineSnapshot(`
+                Object {
+                  "body": "# What's Changed
+
+                ## 🚀 Features
+
+                * Add big feature (#2) @TimonVS
+                * 👽 Add alien technology (#1) @TimonVS
+
+                ## 🐛 Bug Fixes
+
+                * Bug fixes (#3) @TimonVS
+
+                ## 📝 Other Changes
+
+                * Add documentation (#5) @TimonVS
+                * Update dependencies (#4) @TimonVS
+                ",
+                  "draft": true,
+                  "make_latest": "true",
+                  "name": "",
+                  "prerelease": false,
+                  "tag_name": "",
+                  "target_commitish": "refs/heads/master",
+                }
+              `)
+              return true
+            }
+          )
+          .reply(200, releasePayload)
+
+        await probot.receive({
+          name: 'push',
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -838,16 +1058,13 @@ describe('release-drafter', () => {
         nock('https://api.github.com')
           .get('/repos/toolmantim/release-drafter-test-project/releases')
           .query(true)
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-          )
+          .reply(200, graphqlCommitsMergeCommit)
 
         nock('https://api.github.com')
           .post(
@@ -870,19 +1087,21 @@ describe('release-drafter', () => {
                 * Bug fixes (#3) @TimonVS
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "",
                   "prerelease": false,
                   "tag_name": "",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -894,16 +1113,13 @@ describe('release-drafter', () => {
         nock('https://api.github.com')
           .get('/repos/toolmantim/release-drafter-test-project/releases')
           .query(true)
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-overlapping-label.json')
-          )
+          .reply(200, graphqlCommitsOverlappingLabel)
 
         nock('https://api.github.com')
           .post(
@@ -926,19 +1142,21 @@ describe('release-drafter', () => {
                 * Bug fixes (#20) @jetersen
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "",
                   "prerelease": false,
                   "tag_name": "",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -950,16 +1168,13 @@ describe('release-drafter', () => {
         nock('https://api.github.com')
           .get('/repos/toolmantim/release-drafter-test-project/releases')
           .query(true)
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-overlapping-label.json')
-          )
+          .reply(200, graphqlCommitsOverlappingLabel)
 
         nock('https://api.github.com')
           .post(
@@ -986,19 +1201,128 @@ describe('release-drafter', () => {
                 * Bug fixes (#20) @jetersen
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "",
                   "prerelease": false,
                   "tag_name": "",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
+        })
+
+        expect.assertions(1)
+      })
+
+      it('categorizes pull requests with a collapsed category', async () => {
+        getConfigMock('config-with-categories-with-collapse-after.yml')
+
+        nock('https://api.github.com')
+          .get('/repos/toolmantim/release-drafter-test-project/releases')
+          .query(true)
+          .reply(200, [releasePayload])
+
+        nock('https://api.github.com')
+          .post('/graphql', (body) =>
+            body.query.includes('query findCommitsWithAssociatedPullRequests')
+          )
+          .reply(200, graphqlCommitsMergeCommit)
+
+        nock('https://api.github.com')
+          .post(
+            '/repos/toolmantim/release-drafter-test-project/releases',
+            (body) => {
+              expect(body).toMatchInlineSnapshot(`
+                Object {
+                  "body": "# What's Changed
+
+                * Update dependencies (#4) @TimonVS
+
+                ## 🚀 All the things!
+
+                <details>
+                <summary>4 changes</summary>
+
+                * Add documentation (#5) @TimonVS
+                * Bug fixes (#3) @TimonVS
+                * Add big feature (#2) @TimonVS
+                * 👽 Add alien technology (#1) @TimonVS
+                </details>
+                ",
+                  "draft": true,
+                  "make_latest": "true",
+                  "name": "",
+                  "prerelease": false,
+                  "tag_name": "",
+                  "target_commitish": "refs/heads/master",
+                }
+              `)
+              return true
+            }
+          )
+          .reply(200, releasePayload)
+
+        await probot.receive({
+          name: 'push',
+          payload: pushPayload,
+        })
+
+        expect.assertions(1)
+      })
+    })
+
+    describe('with include-pre-releases true config', () => {
+      it('includes pre releases', async () => {
+        getConfigMock('config-with-include-pre-releases-true.yml')
+
+        nock('https://api.github.com')
+          .get('/repos/toolmantim/release-drafter-test-project/releases')
+          .query(true)
+          .reply(200, [release2Payload, preReleasePayload])
+
+        nock('https://api.github.com')
+          .post('/graphql', (body) =>
+            body.query.includes('query findCommitsWithAssociatedPullRequests')
+          )
+          .reply(200, graphqlCommitsMergeCommit)
+
+        nock('https://api.github.com')
+          .post(
+            '/repos/toolmantim/release-drafter-test-project/releases',
+            (body) => {
+              expect(body).toMatchInlineSnapshot(`
+                Object {
+                  "body": "# What's Changed
+
+                * Add documentation (#5) @TimonVS
+                * Update dependencies (#4) @TimonVS
+                * Bug fixes (#3) @TimonVS
+                * Add big feature (#2) @TimonVS
+                * 👽 Add alien technology (#1) @TimonVS
+                ",
+                  "draft": true,
+                  "make_latest": "true",
+                  "name": "v1.5.0",
+                  "prerelease": false,
+                  "tag_name": "v1.5.0",
+                  "target_commitish": "refs/heads/master",
+                }
+              `)
+              return true
+            }
+          )
+          .reply(200, preReleasePayload)
+
+        await probot.receive({
+          name: 'push',
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -1012,16 +1336,13 @@ describe('release-drafter', () => {
         nock('https://api.github.com')
           .get('/repos/toolmantim/release-drafter-test-project/releases')
           .query(true)
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-          )
+          .reply(200, graphqlCommitsMergeCommit)
 
         nock('https://api.github.com')
           .post(
@@ -1043,19 +1364,21 @@ describe('release-drafter', () => {
                 * Bug fixes (#3) @TimonVS
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "",
                   "prerelease": false,
                   "tag_name": "",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -1069,16 +1392,13 @@ describe('release-drafter', () => {
         nock('https://api.github.com')
           .get('/repos/toolmantim/release-drafter-test-project/releases')
           .query(true)
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-          )
+          .reply(200, graphqlCommitsMergeCommit)
 
         nock('https://api.github.com')
           .post(
@@ -1094,19 +1414,21 @@ describe('release-drafter', () => {
                 * 👽 Add alien technology (#1) @TimonVS
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "",
                   "prerelease": false,
                   "tag_name": "",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -1120,16 +1442,13 @@ describe('release-drafter', () => {
         nock('https://api.github.com')
           .get('/repos/toolmantim/release-drafter-test-project/releases')
           .query(true)
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-          )
+          .reply(200, graphqlCommitsMergeCommit)
 
         nock('https://api.github.com')
           .post(
@@ -1137,21 +1456,23 @@ describe('release-drafter', () => {
             (body) => {
               expect(body).toMatchInlineSnapshot(`
                 Object {
-                  "body": "Placeholder with example. Automatically calculated values are next major=3.0.0, minor=2.1.0, patch=2.0.1",
+                  "body": "Placeholder with example. Automatically calculated values are next major=3.0.0 (major=3, minor=0, patch=0), minor=2.1.0 (major=2, minor=1, patch=0), patch=2.0.1 (major=2, minor=0, patch=1)",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "v2.0.1 (Code name: Placeholder)",
                   "prerelease": false,
                   "tag_name": "v2.0.1",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -1163,16 +1484,13 @@ describe('release-drafter', () => {
         nock('https://api.github.com')
           .get('/repos/toolmantim/release-drafter-test-project/releases')
           .query(true)
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-          )
+          .reply(200, graphqlCommitsMergeCommit)
 
         nock('https://api.github.com')
           .post(
@@ -1180,21 +1498,23 @@ describe('release-drafter', () => {
             (body) => {
               expect(body).toMatchInlineSnapshot(`
                 Object {
-                  "body": "Placeholder with example. Automatically calculated values are next major=3.0, minor=2.1, patch=2.0",
+                  "body": "Placeholder with example. Automatically calculated values are next major=3.0 (major=3, minor=0, patch=0), minor=2.1 (major=2, minor=1, patch=0), patch=2.0 (major=2, minor=0, patch=1)",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "v2.1 (Code name: Placeholder)",
                   "prerelease": false,
                   "tag_name": "v2.1",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -1206,16 +1526,13 @@ describe('release-drafter', () => {
         nock('https://api.github.com')
           .get('/repos/toolmantim/release-drafter-test-project/releases')
           .query(true)
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-          )
+          .reply(200, graphqlCommitsMergeCommit)
 
         nock('https://api.github.com')
           .post(
@@ -1223,24 +1540,251 @@ describe('release-drafter', () => {
             (body) => {
               expect(body).toMatchInlineSnapshot(`
                 Object {
-                  "body": "Placeholder with example. Automatically calculated values are next major=3, minor=2, patch=2",
+                  "body": "Placeholder with example. Automatically calculated values are next major=3 (major=3, minor=0, patch=0), minor=2 (major=2, minor=1, patch=0), patch=2 (major=2, minor=0, patch=1)",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "v3 (Code name: Placeholder)",
                   "prerelease": false,
                   "tag_name": "v3",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(1)
+      })
+    })
+
+    describe('with header and footer config', () => {
+      it('only header', async () => {
+        getConfigMock('config-with-header-template.yml')
+
+        nock('https://api.github.com')
+          .get('/repos/toolmantim/release-drafter-test-project/releases')
+          .query(true)
+          .reply(200, [releasePayload])
+
+        nock('https://api.github.com')
+          .post('/graphql', (body) =>
+            body.query.includes('query findCommitsWithAssociatedPullRequests')
+          )
+          .reply(200, graphqlCommitsMergeCommit)
+
+        nock('https://api.github.com')
+          .post(
+            '/repos/toolmantim/release-drafter-test-project/releases',
+            (body) => {
+              expect(body).toMatchInlineSnapshot(`
+                Object {
+                  "body": "This is at top
+                This is the template in the middle
+                ",
+                  "draft": true,
+                  "make_latest": "true",
+                  "name": "",
+                  "prerelease": false,
+                  "tag_name": "",
+                  "target_commitish": "refs/heads/master",
+                }
+              `)
+              return true
+            }
+          )
+          .reply(200, releasePayload)
+
+        await probot.receive({
+          name: 'push',
+          payload: pushPayload,
+        })
+
+        expect.assertions(1)
+      })
+      it('only footer', async () => {
+        getConfigMock('config-with-footer-template.yml')
+
+        nock('https://api.github.com')
+          .get('/repos/toolmantim/release-drafter-test-project/releases')
+          .query(true)
+          .reply(200, [releasePayload])
+
+        nock('https://api.github.com')
+          .post('/graphql', (body) =>
+            body.query.includes('query findCommitsWithAssociatedPullRequests')
+          )
+          .reply(200, graphqlCommitsMergeCommit)
+
+        nock('https://api.github.com')
+          .post(
+            '/repos/toolmantim/release-drafter-test-project/releases',
+            (body) => {
+              expect(body).toMatchInlineSnapshot(`
+                Object {
+                  "body": "This is the template in the middle
+                This is at bottom
+                ",
+                  "draft": true,
+                  "make_latest": "true",
+                  "name": "",
+                  "prerelease": false,
+                  "tag_name": "",
+                  "target_commitish": "refs/heads/master",
+                }
+              `)
+              return true
+            }
+          )
+          .reply(200, releasePayload)
+
+        await probot.receive({
+          name: 'push',
+          payload: pushPayload,
+        })
+
+        expect.assertions(1)
+      })
+      it('header and footer', async () => {
+        getConfigMock('config-with-header-and-footer-template.yml')
+
+        nock('https://api.github.com')
+          .get('/repos/toolmantim/release-drafter-test-project/releases')
+          .query(true)
+          .reply(200, [releasePayload])
+
+        nock('https://api.github.com')
+          .post('/graphql', (body) =>
+            body.query.includes('query findCommitsWithAssociatedPullRequests')
+          )
+          .reply(200, graphqlCommitsMergeCommit)
+
+        nock('https://api.github.com')
+          .post(
+            '/repos/toolmantim/release-drafter-test-project/releases',
+            (body) => {
+              expect(body).toMatchInlineSnapshot(`
+                Object {
+                  "body": "This is at top
+                This is the template in the middle
+                This is at bottom
+                ",
+                  "draft": true,
+                  "make_latest": "true",
+                  "name": "",
+                  "prerelease": false,
+                  "tag_name": "",
+                  "target_commitish": "refs/heads/master",
+                }
+              `)
+              return true
+            }
+          )
+          .reply(200, releasePayload)
+
+        await probot.receive({
+          name: 'push',
+          payload: pushPayload,
+        })
+
+        expect.assertions(1)
+      })
+      it('header and footer without line break and without space', async () => {
+        getConfigMock(
+          'config-with-header-and-footer-no-nl-no-space-template.yml'
+        )
+
+        nock('https://api.github.com')
+          .get('/repos/toolmantim/release-drafter-test-project/releases')
+          .query(true)
+          .reply(200, [releasePayload])
+
+        nock('https://api.github.com')
+          .post('/graphql', (body) =>
+            body.query.includes('query findCommitsWithAssociatedPullRequests')
+          )
+          .reply(200, graphqlCommitsMergeCommit)
+
+        nock('https://api.github.com')
+          .post(
+            '/repos/toolmantim/release-drafter-test-project/releases',
+            (body) => {
+              expect(body).toMatchInlineSnapshot(`
+                Object {
+                  "body": "This is at topThis is the template in the middleThis is at bottom",
+                  "draft": true,
+                  "make_latest": "true",
+                  "name": "",
+                  "prerelease": false,
+                  "tag_name": "",
+                  "target_commitish": "refs/heads/master",
+                }
+              `)
+              return true
+            }
+          )
+          .reply(200, releasePayload)
+
+        await probot.receive({
+          name: 'push',
+          payload: pushPayload,
+        })
+
+        expect.assertions(1)
+      })
+      it('only header from input', async () => {
+        getConfigMock('config-with-header-template.yml')
+
+        let restoreEnvironment = mockedEnv({
+          INPUT_HEADER:
+            'I AM AWESOME_mockenv_strips_newline_and_trailing_spaces_',
+        })
+
+        nock('https://api.github.com')
+          .get('/repos/toolmantim/release-drafter-test-project/releases')
+          .query(true)
+          .reply(200, [releasePayload])
+
+        nock('https://api.github.com')
+          .post('/graphql', (body) =>
+            body.query.includes('query findCommitsWithAssociatedPullRequests')
+          )
+          .reply(200, graphqlCommitsMergeCommit)
+
+        nock('https://api.github.com')
+          .post(
+            '/repos/toolmantim/release-drafter-test-project/releases',
+            (body) => {
+              expect(body).toMatchInlineSnapshot(`
+                Object {
+                  "body": "I AM AWESOME_mockenv_strips_newline_and_trailing_spaces_This is the template in the middle
+                ",
+                  "draft": true,
+                  "make_latest": "true",
+                  "name": "",
+                  "prerelease": false,
+                  "tag_name": "",
+                  "target_commitish": "refs/heads/master",
+                }
+              `)
+              return true
+            }
+          )
+          .reply(200, releasePayload)
+
+        await probot.receive({
+          name: 'push',
+          payload: pushPayload,
+        })
+
+        expect.assertions(1)
+
+        restoreEnvironment()
       })
     })
 
@@ -1253,10 +1797,7 @@ describe('release-drafter', () => {
             .post('/graphql', (body) =>
               body.query.includes('query findCommitsWithAssociatedPullRequests')
             )
-            .reply(
-              200,
-              require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-            )
+            .reply(200, graphqlCommitsMergeCommit)
 
           nock('https://api.github.com')
             .get(
@@ -1279,17 +1820,19 @@ describe('release-drafter', () => {
                   * 👽 Add alien technology (#1) @TimonVS
                   ",
                     "draft": true,
+                    "make_latest": "true",
                     "name": "",
                     "prerelease": false,
                     "tag_name": "",
+                    "target_commitish": "refs/heads/master",
                   }
                 `)
                 return true
               }
             )
-            .reply(200, require('./fixtures/release'))
+            .reply(200, releasePayload)
 
-          const payload = require('./fixtures/push')
+          const payload = pushPayload
 
           await probot.receive({
             name: 'push',
@@ -1308,10 +1851,7 @@ describe('release-drafter', () => {
             .post('/graphql', (body) =>
               body.query.includes('query findCommitsWithAssociatedPullRequests')
             )
-            .reply(
-              200,
-              require('./fixtures/__generated__/graphql-commits-rebase-merging.json')
-            )
+            .reply(200, graphqlCommitsRebaseMerging)
 
           nock('https://api.github.com')
             .get(
@@ -1334,17 +1874,19 @@ describe('release-drafter', () => {
                   * 👽 Add alien technology (#6) @TimonVS
                   ",
                     "draft": true,
+                    "make_latest": "true",
                     "name": "",
                     "prerelease": false,
                     "tag_name": "",
+                    "target_commitish": "refs/heads/master",
                   }
                 `)
                 return true
               }
             )
-            .reply(200, require('./fixtures/release'))
+            .reply(200, releasePayload)
 
-          const payload = require('./fixtures/push')
+          const payload = pushPayload
 
           await probot.receive({
             name: 'push',
@@ -1363,10 +1905,7 @@ describe('release-drafter', () => {
             .post('/graphql', (body) =>
               body.query.includes('query findCommitsWithAssociatedPullRequests')
             )
-            .reply(
-              200,
-              require('./fixtures/__generated__/graphql-commits-squash-merging.json')
-            )
+            .reply(200, graphqlCommitsSquashMerging)
 
           nock('https://api.github.com')
             .get(
@@ -1389,17 +1928,19 @@ describe('release-drafter', () => {
                   * 👽 Add alien technology (#11) @TimonVS
                   ",
                     "draft": true,
+                    "make_latest": "true",
                     "name": "",
                     "prerelease": false,
                     "tag_name": "",
+                    "target_commitish": "refs/heads/master",
                   }
                 `)
                 return true
               }
             )
-            .reply(200, require('./fixtures/release'))
+            .reply(200, releasePayload)
 
-          const payload = require('./fixtures/push')
+          const payload = pushPayload
 
           await probot.receive({
             name: 'push',
@@ -1416,16 +1957,13 @@ describe('release-drafter', () => {
             .get(
               '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
             )
-            .reply(200, [require('./fixtures/release-shared-commit-date')])
+            .reply(200, [releaseSharedCommitDate])
 
           nock('https://api.github.com')
             .post('/graphql', (body) =>
               body.query.includes('query findCommitsWithAssociatedPullRequests')
             )
-            .reply(
-              200,
-              require('./fixtures/__generated__/graphql-commits-squash-merging.json')
-            )
+            .reply(200, graphqlCommitsSquashMerging)
 
           nock('https://api.github.com')
             .post(
@@ -1441,19 +1979,21 @@ describe('release-drafter', () => {
                   * Add big feature (#12) @TimonVS
                   ",
                     "draft": true,
+                    "make_latest": "true",
                     "name": "",
                     "prerelease": false,
                     "tag_name": "",
+                    "target_commitish": "refs/heads/master",
                   }
                 `)
                 return true
               }
             )
-            .reply(200, require('./fixtures/release'))
+            .reply(200, releasePayload)
 
           await probot.receive({
             name: 'push',
-            payload: require('./fixtures/push'),
+            payload: pushPayload,
           })
 
           expect.assertions(1)
@@ -1467,16 +2007,13 @@ describe('release-drafter', () => {
           nock('https://api.github.com')
             .get('/repos/toolmantim/release-drafter-test-project/releases')
             .query(true)
-            .reply(200, [require('./fixtures/release')])
+            .reply(200, [releasePayload])
 
           nock('https://api.github.com')
             .post('/graphql', (body) =>
               body.query.includes('query findCommitsWithAssociatedPullRequests')
             )
-            .reply(
-              200,
-              require('./fixtures/__generated__/graphql-commits-forking.json')
-            )
+            .reply(200, graphqlCommitsForking)
 
           nock('https://api.github.com')
             .post(
@@ -1495,19 +2032,21 @@ describe('release-drafter', () => {
                   * Update dependencies (#4) @TimonVS
                   ",
                     "draft": true,
+                    "make_latest": "true",
                     "name": "",
                     "prerelease": false,
                     "tag_name": "",
+                    "target_commitish": "refs/heads/master",
                   }
                 `)
                 return true
               }
             )
-            .reply(200, require('./fixtures/release'))
+            .reply(200, releasePayload)
 
           await probot.receive({
             name: 'push',
-            payload: require('./fixtures/push'),
+            payload: pushPayload,
           })
 
           expect.assertions(1)
@@ -1523,11 +2062,11 @@ describe('release-drafter', () => {
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(200, require('./fixtures/graphql-commits-paginated-1.json'))
+          .reply(200, graphqlCommitsPaginated1)
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(200, require('./fixtures/graphql-commits-paginated-2.json'))
+          .reply(200, graphqlCommitsPaginated2)
 
         nock('https://api.github.com')
           .get(
@@ -1561,17 +2100,19 @@ describe('release-drafter', () => {
                 * Create new-feature.md (#1) @toolmantim
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "",
                   "prerelease": false,
                   "tag_name": "",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
-        const payload = require('./fixtures/push')
+        const payload = pushPayload
 
         await probot.receive({
           name: 'push',
@@ -1590,10 +2131,7 @@ describe('release-drafter', () => {
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-          )
+          .reply(200, graphqlCommitsMergeCommit)
 
         nock('https://api.github.com')
           .get(
@@ -1616,17 +2154,19 @@ describe('release-drafter', () => {
                 * 👽 Add alien technology (#1) @TimonVS
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "",
                   "prerelease": false,
                   "tag_name": "",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
-        const payload = require('./fixtures/push')
+        const payload = pushPayload
 
         await probot.receive({
           name: 'push',
@@ -1646,11 +2186,11 @@ describe('release-drafter', () => {
         .post('/graphql', (body) =>
           body.query.includes('query findCommitsWithAssociatedPullRequests')
         )
-        .reply(200, require('./fixtures/graphql-commits-paginated-1.json'))
+        .reply(200, graphqlCommitsPaginated1)
         .post('/graphql', (body) =>
           body.query.includes('query findCommitsWithAssociatedPullRequests')
         )
-        .reply(200, require('./fixtures/graphql-commits-paginated-2.json'))
+        .reply(200, graphqlCommitsPaginated2)
 
       nock('https://api.github.com')
         .get(
@@ -1684,17 +2224,19 @@ describe('release-drafter', () => {
               * 1️⃣ Switch to a monorepo (#9) @toolmantim
               ",
                 "draft": true,
+                "make_latest": "true",
                 "name": "",
                 "prerelease": false,
                 "tag_name": "",
+                "target_commitish": "refs/heads/master",
               }
             `)
             return true
           }
         )
-        .reply(200, require('./fixtures/release'))
+        .reply(200, releasePayload)
 
-      const payload = require('./fixtures/push')
+      const payload = pushPayload
 
       await probot.receive({
         name: 'push',
@@ -1713,11 +2255,11 @@ describe('release-drafter', () => {
         .post('/graphql', (body) =>
           body.query.includes('query findCommitsWithAssociatedPullRequests')
         )
-        .reply(200, require('./fixtures/graphql-commits-paginated-1.json'))
+        .reply(200, graphqlCommitsPaginated1)
         .post('/graphql', (body) =>
           body.query.includes('query findCommitsWithAssociatedPullRequests')
         )
-        .reply(200, require('./fixtures/graphql-commits-paginated-2.json'))
+        .reply(200, graphqlCommitsPaginated2)
 
       nock('https://api.github.com')
         .get(
@@ -1751,17 +2293,199 @@ describe('release-drafter', () => {
               * Added great distance (#16) @toolmantim
               ",
                 "draft": true,
+                "make_latest": "true",
                 "name": "",
                 "prerelease": false,
                 "tag_name": "",
+                "target_commitish": "refs/heads/master",
               }
             `)
             return true
           }
         )
-        .reply(200, require('./fixtures/release'))
+        .reply(200, releasePayload)
 
-      const payload = require('./fixtures/push')
+      const payload = pushPayload
+
+      await probot.receive({
+        name: 'push',
+        payload,
+      })
+
+      expect.assertions(1)
+    })
+  })
+
+  describe('with include-paths config', () => {
+    it('returns all PRs when not path filtered', async () => {
+      getConfigMock('config-with-include-paths.yml')
+
+      nock('https://api.github.com')
+        .post('/graphql', (body) =>
+          body.query.includes('query findCommitsWithAssociatedPullRequests')
+        )
+        .reply(200, graphqlCommitsMergeCommit)
+        .post('/graphql', (body) =>
+          body.query.includes('query findCommitsWithPathChangesQuery')
+        )
+        .reply(200, graphqlNullIncludePathMergeCommit)
+
+      nock('https://api.github.com')
+        .get(
+          '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
+        )
+        .reply(200, [])
+
+      nock('https://api.github.com')
+        .post(
+          '/repos/toolmantim/release-drafter-test-project/releases',
+          (body) => {
+            expect(body).toMatchInlineSnapshot(`
+              Object {
+                "body": "# What's Changed
+              * Add documentation (#5) @TimonVS
+              * Update dependencies (#4) @TimonVS
+              * Bug fixes (#3) @TimonVS
+              * Add big feature (#2) @TimonVS
+              * 👽 Add alien technology (#1) @TimonVS
+              ",
+                "draft": true,
+                "make_latest": "true",
+                "name": "v$INPUT_VERSION (Code name: Placeholder)",
+                "prerelease": false,
+                "tag_name": "v$INPUT_VERSION",
+                "target_commitish": "refs/heads/master",
+              }
+            `)
+            return true
+          }
+        )
+        .reply(200, releasePayload)
+
+      const payload = pushPayload
+
+      await probot.receive({
+        name: 'push',
+        payload,
+      })
+
+      expect.assertions(1)
+    })
+
+    it('returns the modified paths', async () => {
+      getConfigMock('config-with-include-paths.yml')
+
+      nock('https://api.github.com')
+        .post('/graphql', (body) =>
+          body.query.includes('query findCommitsWithAssociatedPullRequests')
+        )
+        .reply(200, graphqlCommitsMergeCommit)
+        .post('/graphql', (body) =>
+          body.query.includes('query findCommitsWithPathChangesQuery')
+        )
+        .reply(200, graphqlIncludePathMergeCommit)
+
+      nock('https://api.github.com')
+        .get(
+          '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
+        )
+        .reply(200, [])
+
+      nock('https://api.github.com')
+        .post(
+          '/repos/toolmantim/release-drafter-test-project/releases',
+          (body) => {
+            expect(body).toMatchInlineSnapshot(`
+              Object {
+                "body": "# What's Changed
+              * Add documentation (#5) @TimonVS
+              ",
+                "draft": true,
+                "make_latest": "true",
+                "name": "v$INPUT_VERSION (Code name: Placeholder)",
+                "prerelease": false,
+                "tag_name": "v$INPUT_VERSION",
+                "target_commitish": "refs/heads/master",
+              }
+            `)
+            return true
+          }
+        )
+        .reply(200, releasePayload)
+
+      const payload = pushPayload
+
+      await probot.receive({
+        name: 'push',
+        payload,
+      })
+
+      expect.assertions(1)
+    })
+  })
+
+  describe('with pull-request-limit config', () => {
+    it('uses the correct default when not specified', async () => {
+      getConfigMock()
+
+      nock('https://api.github.com')
+        .post('/graphql', (body) => {
+          if (
+            body.query.includes('query findCommitsWithAssociatedPullRequests')
+          ) {
+            expect(body.variables.pullRequestLimit).toBe(5)
+            return true
+          }
+          return false
+        })
+        .reply(200, graphqlCommitsNoPRsPayload)
+
+      nock('https://api.github.com')
+        .get(
+          '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
+        )
+        .reply(200, [])
+
+      nock('https://api.github.com')
+        .post('/repos/toolmantim/release-drafter-test-project/releases')
+        .reply(200, releasePayload)
+
+      const payload = pushPayload
+
+      await probot.receive({
+        name: 'push',
+        payload,
+      })
+
+      expect.assertions(1)
+    })
+
+    it('requests the specified number of associated PRs', async () => {
+      getConfigMock('config-with-pull-request-limit.yml')
+
+      nock('https://api.github.com')
+        .post('/graphql', (body) => {
+          if (
+            body.query.includes('query findCommitsWithAssociatedPullRequests')
+          ) {
+            expect(body.variables.pullRequestLimit).toBe(34)
+            return true
+          }
+          return false
+        })
+        .reply(200, graphqlCommitsNoPRsPayload)
+
+      nock('https://api.github.com')
+        .get(
+          '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
+        )
+        .reply(200, [])
+
+      nock('https://api.github.com')
+        .post('/repos/toolmantim/release-drafter-test-project/releases')
+        .reply(200, releasePayload)
+
+      const payload = pushPayload
 
       await probot.receive({
         name: 'push',
@@ -1776,20 +2500,18 @@ describe('release-drafter', () => {
     it('schema error', async () => {
       getConfigMock('config-with-schema-error.yml')
 
-      const payload = require('./fixtures/push')
+      const payload = pushPayload
 
       await probot.receive({
         name: 'push',
         payload,
       })
-      expect(logger).toHaveBeenCalledWith(
+      expect(logger[0]).toEqual(
         expect.objectContaining({
           msg: expect.stringContaining('Invalid config file'),
-          err: expect.objectContaining({
-            message: expect.stringContaining(
-              '"search" is required and must be a regexp or a string'
-            ),
-          }),
+          stack: expect.stringContaining(
+            '"search" is required and must be a regexp or a string'
+          ),
         })
       )
     })
@@ -1797,20 +2519,18 @@ describe('release-drafter', () => {
     it('yaml exception', async () => {
       getConfigMock('config-with-yaml-exception.yml')
 
-      const payload = require('./fixtures/push')
+      const payload = pushPayload
 
       await probot.receive({
         name: 'push',
         payload,
       })
-      expect(logger).toHaveBeenCalledWith(
+      expect(logger[0]).toEqual(
         expect.objectContaining({
           msg: expect.stringContaining('Invalid config file'),
-          err: expect.objectContaining({
-            message: expect.stringContaining(
-              'end of the stream or a document separator is expected at line 1, column 18:'
-            ),
-          }),
+          stack: expect.stringContaining(
+            'Configuration could not be parsed from'
+          ),
         })
       )
     })
@@ -1823,7 +2543,7 @@ describe('release-drafter', () => {
         with:
           config-name: 'config-name-input.yml'
       */
-      let restoreEnv = mockedEnv({
+      let restoreEnvironment = mockedEnv({
         'INPUT_CONFIG-NAME': 'config-name-input.yml',
       })
 
@@ -1837,12 +2557,12 @@ describe('release-drafter', () => {
         .post('/graphql', (body) =>
           body.query.includes('query findCommitsWithAssociatedPullRequests')
         )
-        .reply(200, require('./fixtures/graphql-commits-no-prs.json'))
+        .reply(200, graphqlCommitsNoPRsPayload)
 
       nock('https://api.github.com')
         .get('/repos/toolmantim/release-drafter-test-project/releases')
         .query(true)
-        .reply(200, [require('./fixtures/release')])
+        .reply(200, [releasePayload])
         .post(
           '/repos/toolmantim/release-drafter-test-project/releases',
           (body) => {
@@ -1852,19 +2572,21 @@ describe('release-drafter', () => {
                 "body": "# There's new stuff!
               ",
                 "draft": true,
+                "make_latest": "true",
                 "name": "",
                 "prerelease": false,
                 "tag_name": "",
+                "target_commitish": "refs/heads/master",
               }
             `)
             return true
           }
         )
-        .reply(200, require('./fixtures/release'))
+        .reply(200, releasePayload)
 
       await probot.receive({
         name: 'push',
-        payload: require('./fixtures/push'),
+        payload: pushPayload,
       })
 
       // Assert that the GET request was called for the correct config file
@@ -1872,85 +2594,89 @@ describe('release-drafter', () => {
 
       expect.assertions(2)
 
-      restoreEnv()
+      restoreEnvironment()
     })
   })
 
-  describe('input publish, prerelease, version, tag and name overrides', () => {
-    // Method with all the test's logic, to prevent duplication
-    const overridesTest = async (overrides, expectedBody) => {
-      let mockEnv = {}
+  const overridesTest = async (overrides, expectedBody) => {
+    let mockEnvironment = {}
 
-      /*
-        Mock
-        with:
-          # any combination (or none) of these input options (examples):
-          version: '2.1.1'
-          tag: 'v2.1.1-alpha'
-          name: 'v2.1.1-alpha (Code name: Example)'
-      */
-      if (overrides) {
-        if (overrides.version) {
-          mockEnv['INPUT_VERSION'] = overrides.version
-        }
-
-        if (overrides.tag) {
-          mockEnv['INPUT_TAG'] = overrides.tag
-        }
-
-        if (overrides.name) {
-          mockEnv['INPUT_NAME'] = overrides.name
-        }
-
-        if (overrides.publish) {
-          mockEnv['INPUT_PUBLISH'] = overrides.publish
-        }
-
-        if (overrides.prerelease) {
-          mockEnv['INPUT_PRERELEASE'] = overrides.prerelease
-        }
+    /*
+      Mock
+      with:
+        # any combination (or none) of these input options (examples):
+        version: '2.1.1'
+        tag: 'v2.1.1-alpha'
+        name: 'v2.1.1-alpha (Code name: Example)'
+    */
+    if (overrides) {
+      if (overrides.version) {
+        mockEnvironment['INPUT_VERSION'] = overrides.version
       }
 
-      let restoreEnv = mockedEnv(mockEnv)
+      if (overrides.tag) {
+        mockEnvironment['INPUT_TAG'] = overrides.tag
+      }
 
-      getConfigMock(
-        (overrides && overrides.configName) ||
-          'config-with-input-version-template.yml'
-      )
+      if (overrides.name) {
+        mockEnvironment['INPUT_NAME'] = overrides.name
+      }
 
-      nock('https://api.github.com')
-        .get('/repos/toolmantim/release-drafter-test-project/releases')
-        .query(true)
-        .reply(200, [require('./fixtures/release')])
+      if (overrides.publish) {
+        mockEnvironment['INPUT_PUBLISH'] = overrides.publish
+      }
 
-      nock('https://api.github.com')
-        .post('/graphql', (body) =>
-          body.query.includes('query findCommitsWithAssociatedPullRequests')
-        )
-        .reply(
-          200,
-          require('./fixtures/__generated__/graphql-commits-merge-commit.json')
-        )
+      if (overrides.prerelease) {
+        mockEnvironment['INPUT_PRERELEASE'] = overrides.prerelease
+      }
 
-      nock('https://api.github.com')
-        .post(
-          '/repos/toolmantim/release-drafter-test-project/releases',
-          (body) => {
-            expect(body).toMatchObject(expectedBody)
-            return true
-          }
-        )
-        .reply(200, require('./fixtures/release'))
-
-      await probot.receive({
-        name: 'push',
-        payload: require('./fixtures/push'),
-      })
-
-      expect.assertions(1)
-
-      restoreEnv()
+      if (overrides.prereleaseIdentifier) {
+        mockEnvironment['INPUT_PRERELEASE-IDENTIFIER'] =
+          overrides.prereleaseIdentifier
+      }
     }
+
+    let restoreEnvironment_ = mockedEnv(mockEnvironment)
+
+    const config =
+      (overrides && overrides.configName) ||
+      'config-with-input-version-template.yml'
+
+    getConfigMock(config)
+
+    nock('https://api.github.com')
+      .get('/repos/toolmantim/release-drafter-test-project/releases')
+      .query(true)
+      .reply(200, [releasePayload])
+
+    nock('https://api.github.com')
+      .post('/graphql', (body) =>
+        body.query.includes('query findCommitsWithAssociatedPullRequests')
+      )
+      .reply(200, graphqlCommitsMergeCommit)
+
+    nock('https://api.github.com')
+      .post(
+        '/repos/toolmantim/release-drafter-test-project/releases',
+        (body) => {
+          expect(body).toMatchObject(expectedBody)
+          return true
+        }
+      )
+      .reply(200, releasePayload)
+
+    await probot.receive({
+      name: 'push',
+      payload: pushPayload,
+    })
+
+    expect.assertions(1)
+
+    restoreEnvironment_()
+  }
+
+  describe('input publish, prerelease, version, tag and name overrides', () => {
+    // Method with all the test's logic, to prevent duplication
 
     describe('with just the version', () => {
       it('forces the version on templates', async () => {
@@ -1980,6 +2706,23 @@ describe('release-drafter', () => {
       })
     })
 
+    describe('with just the tag containing variables', () => {
+      it('gets the version from the tag and expands variables in it', async () => {
+        return overridesTest(
+          {
+            tag: 'v$RESOLVED_VERSION-RC1',
+            configName: 'config-with-name-and-tag-template.yml',
+          },
+          {
+            body: `Placeholder with example. Automatically calculated values based on previous releases are next major=3.0.0, minor=2.1.0, patch=2.0.1.`,
+            draft: true,
+            name: 'v1.0.0-beta (Code name: Hello World)',
+            tag_name: 'v1.0.0-RC1',
+          }
+        )
+      })
+    })
+
     describe('with just the name', () => {
       it('gets the version from the name and forces using the name', async () => {
         return overridesTest(
@@ -1989,6 +2732,23 @@ describe('release-drafter', () => {
             draft: true,
             name: 'v2.1.1-alpha (Code name: Foxtrot Unicorn)',
             tag_name: 'v2.1.1',
+          }
+        )
+      })
+    })
+
+    describe('with just the name containing variables', () => {
+      it('gets the version from the name and expands variables in it', async () => {
+        return overridesTest(
+          {
+            name: 'v$RESOLVED_VERSION-RC1 (Code name: Hello World)',
+            configName: 'config-with-name-and-tag-template.yml',
+          },
+          {
+            body: `Placeholder with example. Automatically calculated values based on previous releases are next major=3.0.0, minor=2.1.0, patch=2.0.1.`,
+            draft: true,
+            name: 'v1.0.0-RC1 (Code name: Hello World)',
+            tag_name: 'v1.0.0-beta',
           }
         )
       })
@@ -2020,6 +2780,37 @@ describe('release-drafter', () => {
           {
             draft: true,
             prerelease: true,
+          }
+        )
+      })
+
+      it('resolves tag with incremented prerelease identifier', async () => {
+        return overridesTest(
+          {
+            prerelease: 'true',
+            configName: 'config-with-pre-release-identifier.yml',
+          },
+          {
+            prerelease: true,
+            name: 'v2.0.1-alpha.0',
+            tag_name: 'v2.0.1-alpha.0',
+          }
+        )
+      })
+    })
+
+    describe('with input prerelease: true and input prerelease-identifier', () => {
+      it('resolves tag with incremented pre-release identifier', async () => {
+        return overridesTest(
+          {
+            prerelease: 'true',
+            prereleaseIdentifier: 'beta',
+            configName: 'config-with-pre-release-identifier.yml',
+          },
+          {
+            prerelease: true,
+            name: 'v2.0.1-beta.0',
+            tag_name: 'v2.0.1-beta.0',
           }
         )
       })
@@ -2133,7 +2924,7 @@ describe('release-drafter', () => {
   describe('resolved version', () => {
     describe('without previous releases, overriding the tag', () => {
       it('resolves to the version extracted from the tag', async () => {
-        let restoreEnv = mockedEnv({ INPUT_TAG: 'v1.0.2' })
+        let restoreEnvironment = mockedEnv({ INPUT_TAG: 'v1.0.2' })
 
         getConfigMock('config-with-resolved-version-template.yml')
 
@@ -2141,7 +2932,7 @@ describe('release-drafter', () => {
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(200, require('./fixtures/graphql-commits-empty.json'))
+          .reply(200, graphqlCommitsEmpty)
 
         nock('https://api.github.com')
           .get('/repos/toolmantim/release-drafter-test-project/releases')
@@ -2158,37 +2949,39 @@ describe('release-drafter', () => {
 
                 ## Contributors
 
-                $CONTRIBUTORS
+                No contributors
 
                 ## Previous release
 
 
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "v1.0.2 🌈",
                   "prerelease": false,
                   "tag_name": "v1.0.2",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(1)
 
-        restoreEnv()
+        restoreEnvironment()
       })
     })
 
     describe('with previous releases, overriding the tag', () => {
       it('resolves to the version extracted from the tag', async () => {
-        let restoreEnv = mockedEnv({ INPUT_TAG: 'v1.0.2' })
+        let restoreEnvironment = mockedEnv({ INPUT_TAG: 'v1.0.2' })
 
         getConfigMock('config-with-resolved-version-template.yml')
 
@@ -2196,12 +2989,12 @@ describe('release-drafter', () => {
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(200, require('./fixtures/graphql-commits-no-prs.json'))
+          .reply(200, graphqlCommitsNoPRsPayload)
 
         nock('https://api.github.com')
           .get('/repos/toolmantim/release-drafter-test-project/releases')
           .query(true)
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
           .post(
             '/repos/toolmantim/release-drafter-test-project/releases',
             (body) => {
@@ -2220,36 +3013,38 @@ describe('release-drafter', () => {
                 v2.0.0
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "v1.0.2 🌈",
                   "prerelease": false,
                   "tag_name": "v1.0.2",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(1)
 
-        restoreEnv()
+        restoreEnvironment()
       })
     })
 
     describe('without previous releases, no overrides', () => {
-      it('resolves to the calculated version, which will be empty', async () => {
+      it('resolves to the calculated version, which will be default', async () => {
         getConfigMock('config-with-resolved-version-template.yml')
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(200, require('./fixtures/graphql-commits-empty.json'))
+          .reply(200, graphqlCommitsEmpty)
 
         nock('https://api.github.com')
           .get('/repos/toolmantim/release-drafter-test-project/releases')
@@ -2266,26 +3061,28 @@ describe('release-drafter', () => {
 
                 ## Contributors
 
-                $CONTRIBUTORS
+                No contributors
 
                 ## Previous release
 
 
                 ",
                   "draft": true,
-                  "name": "",
+                  "make_latest": "true",
+                  "name": "v0.1.0 🌈",
                   "prerelease": false,
-                  "tag_name": "",
+                  "tag_name": "v0.1.0",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -2300,12 +3097,12 @@ describe('release-drafter', () => {
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(200, require('./fixtures/graphql-commits-no-prs.json'))
+          .reply(200, graphqlCommitsNoPRsPayload)
 
         nock('https://api.github.com')
           .get('/repos/toolmantim/release-drafter-test-project/releases')
           .query(true)
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
           .post(
             '/repos/toolmantim/release-drafter-test-project/releases',
             (body) => {
@@ -2324,19 +3121,74 @@ describe('release-drafter', () => {
                 v2.0.0
                 ",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "v2.0.1 🌈",
                   "prerelease": false,
                   "tag_name": "v2.0.1",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
+        })
+
+        expect.assertions(1)
+      })
+    })
+
+    describe('with tag-prefix', () => {
+      it('gets the version from the tag, stripping the prefix', async () => {
+        getConfigMock('config-with-tag-prefix.yml')
+        // Explicitly include a RC suffix in order to differentiate the
+        // behaviour of semver.parse vs semver.coerce in versions.js
+        //
+        // We expect the release to be 2.1.4, not 2.1.5
+        const alteredReleasePayload = {
+          ...releasePayload,
+          tag_name: 'static-tag-prefix-v2.1.4-RC3',
+        }
+
+        nock('https://api.github.com')
+          .post('/graphql', (body) =>
+            body.query.includes('query findCommitsWithAssociatedPullRequests')
+          )
+          .reply(200, graphqlCommitsNoPRsPayload)
+
+        nock('https://api.github.com')
+          .get('/repos/toolmantim/release-drafter-test-project/releases')
+          .query(true)
+          .reply(200, [alteredReleasePayload])
+          .post(
+            '/repos/toolmantim/release-drafter-test-project/releases',
+            (body) => {
+              expect(body).toMatchInlineSnapshot(`
+                Object {
+                  "body": "## Previous release
+
+                static-tag-prefix-v2.1.4-RC3
+                ",
+                  "draft": true,
+                  "make_latest": "true",
+                  "name": "static-tag-prefix-v2.1.4 🌈",
+                  "prerelease": false,
+                  "tag_name": "static-tag-prefix-v2.1.4",
+                  "target_commitish": "refs/heads/master",
+                }
+              `)
+              return true
+            }
+          )
+          .reply(200, alteredReleasePayload)
+
+        await probot.receive({
+          name: 'push',
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -2351,16 +3203,13 @@ describe('release-drafter', () => {
           .get(
             '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
           )
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-forking.json')
-          )
+          .reply(200, graphqlCommitsForking)
 
         nock('https://api.github.com')
           .post(
@@ -2370,19 +3219,21 @@ describe('release-drafter', () => {
                 Object {
                   "body": "dummy",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "v2.1.0",
                   "prerelease": false,
                   "tag_name": "v2.1.0",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -2394,16 +3245,13 @@ describe('release-drafter', () => {
           .get(
             '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
           )
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-forking.json')
-          )
+          .reply(200, graphqlCommitsForking)
 
         nock('https://api.github.com')
           .post(
@@ -2413,19 +3261,21 @@ describe('release-drafter', () => {
                 Object {
                   "body": "dummy",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "v2.0.1",
                   "prerelease": false,
                   "tag_name": "v2.0.1",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -2437,16 +3287,13 @@ describe('release-drafter', () => {
           .get(
             '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
           )
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-forking.json')
-          )
+          .reply(200, graphqlCommitsForking)
 
         nock('https://api.github.com')
           .post(
@@ -2456,19 +3303,21 @@ describe('release-drafter', () => {
                 Object {
                   "body": "dummy",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "v2.1.0",
                   "prerelease": false,
                   "tag_name": "v2.1.0",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
         })
 
         expect.assertions(1)
@@ -2480,16 +3329,13 @@ describe('release-drafter', () => {
           .get(
             '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
           )
-          .reply(200, [require('./fixtures/release')])
+          .reply(200, [releasePayload])
 
         nock('https://api.github.com')
           .post('/graphql', (body) =>
             body.query.includes('query findCommitsWithAssociatedPullRequests')
           )
-          .reply(
-            200,
-            require('./fixtures/__generated__/graphql-commits-forking.json')
-          )
+          .reply(200, graphqlCommitsForking)
 
         nock('https://api.github.com')
           .post(
@@ -2499,19 +3345,109 @@ describe('release-drafter', () => {
                 Object {
                   "body": "dummy",
                   "draft": true,
+                  "make_latest": "true",
                   "name": "v3.0.0",
                   "prerelease": false,
                   "tag_name": "v3.0.0",
+                  "target_commitish": "refs/heads/master",
                 }
               `)
               return true
             }
           )
-          .reply(200, require('./fixtures/release'))
+          .reply(200, releasePayload)
 
         await probot.receive({
           name: 'push',
-          payload: require('./fixtures/push'),
+          payload: pushPayload,
+        })
+
+        expect.assertions(1)
+      })
+
+      it('major beats others partial config', async () => {
+        getConfigMock('config-with-custom-version-resolver-partial.yml')
+
+        nock('https://api.github.com')
+          .get(
+            '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
+          )
+          .reply(200, [releasePayload])
+
+        nock('https://api.github.com')
+          .post('/graphql', (body) =>
+            body.query.includes('query findCommitsWithAssociatedPullRequests')
+          )
+          .reply(200, graphqlCommitsForking)
+
+        nock('https://api.github.com')
+          .post(
+            '/repos/toolmantim/release-drafter-test-project/releases',
+            (body) => {
+              expect(body).toMatchInlineSnapshot(`
+                Object {
+                  "body": "dummy",
+                  "draft": true,
+                  "make_latest": "true",
+                  "name": "v3.0.0",
+                  "prerelease": false,
+                  "tag_name": "v3.0.0",
+                  "target_commitish": "refs/heads/master",
+                }
+              `)
+              return true
+            }
+          )
+          .reply(200, releasePayload)
+
+        await probot.receive({
+          name: 'push',
+          payload: pushPayload,
+        })
+
+        expect.assertions(1)
+      })
+    })
+
+    describe('with commitish', () => {
+      it('allows specification of a target commitish', async () => {
+        getConfigMock('config-with-commitish.yml')
+
+        nock('https://api.github.com')
+          .get(
+            '/repos/toolmantim/release-drafter-test-project/releases?per_page=100'
+          )
+          .reply(200, [releasePayload])
+
+        nock('https://api.github.com')
+          .post('/graphql', (body) =>
+            body.query.includes('query findCommitsWithAssociatedPullRequests')
+          )
+          .reply(200, graphqlCommitsForking)
+
+        nock('https://api.github.com')
+          .post(
+            '/repos/toolmantim/release-drafter-test-project/releases',
+            (body) => {
+              expect(body).toMatchInlineSnapshot(`
+                Object {
+                  "body": "dummy",
+                  "draft": true,
+                  "make_latest": "true",
+                  "name": "",
+                  "prerelease": false,
+                  "tag_name": "",
+                  "target_commitish": "staging",
+                }
+              `)
+              return true
+            }
+          )
+          .reply(200, releasePayload)
+
+        await probot.receive({
+          name: 'push',
+          payload: pushPayload,
         })
 
         expect.assertions(1)
